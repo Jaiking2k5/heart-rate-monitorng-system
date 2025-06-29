@@ -1,0 +1,186 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char auth[] = "Your_Blynk_Auth_Token";       // from Blynk console
+char ssid[] = "Your_WiFi_SSID";
+char pass[] = "Your_WiFi_Password";
+
+
+unsigned long lastDisplayUpdate = 0;
+const unsigned long displayInterval = 500;
+
+// OLED pins
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_MOSI  23
+#define OLED_CLK   18
+#define OLED_DC    16
+#define OLED_CS    5
+#define OLED_RESET 17
+
+// Sensor pins
+#define GSR_PIN   34
+#define GSR_LED   15
+#define PULSE_PIN 32
+#define LED_PIN   2
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT,
+                         &SPI, OLED_DC, OLED_RESET, OLED_CS);
+
+// BPM variables
+int bpm = 0;
+bool pulseDetected = false;
+unsigned long lastBeatTime = 0;
+
+// Calibration globals
+int threshold = 0;
+int thresholdHigh = 0;
+int thresholdLow  = 0;
+int calibRange    = 0;
+bool pulseSensorActive = false;
+const int HYST_MARGIN = 20;
+
+// GSR calibration
+int baselineGSR = 0;
+
+void calibratePulseThreshold() {
+  long maxVal = 0;
+  long minVal = 4095;
+
+  Serial.println("Place your finger on the pulse sensor now...");
+  delay(2000);
+
+  for (int i = 0; i < 200; i++) {
+    int val = analogRead(PULSE_PIN);
+    if (val > maxVal) maxVal = val;
+    if (val < minVal) minVal = val;
+    delay(5);
+  }
+
+  calibRange = maxVal - minVal;
+  Serial.print("Calibration range: "); Serial.println(calibRange);
+
+  if (calibRange > 100) {
+    threshold = minVal + (calibRange / 2);
+    // set hysteresis margins
+    thresholdHigh = threshold + HYST_MARGIN;
+    thresholdLow  = threshold - HYST_MARGIN;
+    pulseSensorActive = true;
+    Serial.print("Threshold: "); Serial.println(threshold);
+    Serial.print("ThreshHigh: "); Serial.println(thresholdHigh);
+    Serial.print("ThreshLow:  "); Serial.println(thresholdLow);
+  } else {
+    pulseSensorActive = false;
+    Serial.println("Bad calibration — pulse detection disabled.");
+  }
+}
+
+void captureBaseline() {
+  long sum = 0;
+  for (int i = 0; i < 100; i++) {
+    sum += analogRead(GSR_PIN);
+    delay(10);
+  }
+  baselineGSR = sum / 100;
+  Serial.print("Baseline GSR: ");
+  Serial.println(baselineGSR);
+}
+
+String getStressLevel(int gsr) {
+  int diff = gsr - baselineGSR;
+  if (diff < 50)  return "Calm";
+  if (diff < 100) return "Mild";
+  if (diff < 300) return "High";
+  return "Very High";
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  pinMode(GSR_LED, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  Blynk.begin(auth, ssid, pass);
+
+  // 1) Pulse calibration
+  calibratePulseThreshold();
+
+  // 2) GSR calibration
+  captureBaseline();
+
+  // 3) Avoid wild first interval
+  lastBeatTime = millis();
+
+  // 4) Init display
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println("OLED init failed!");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+
+  Serial.println("Setup complete.");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // --- GSR ---
+  int gsrValue = analogRead(GSR_PIN);
+  String stress = getStressLevel(gsrValue);
+  Serial.print("GSR: "); Serial.println(gsrValue);
+
+  // GSR LED logic
+  static unsigned long lastBlink = 0;
+  int diffG = gsrValue - baselineGSR;
+  if (diffG < 20)           digitalWrite(GSR_LED, LOW);
+  else if (diffG < 100)     { if (now - lastBlink > 500) { digitalWrite(GSR_LED, !digitalRead(GSR_LED)); lastBlink = now; }}
+  else if (diffG < 300)     { if (now - lastBlink > 250) { digitalWrite(GSR_LED, !digitalRead(GSR_LED)); lastBlink = now; }}
+  else                      digitalWrite(GSR_LED, HIGH);
+
+  // --- Pulse & BPM ---
+  int pulseValue = analogRead(PULSE_PIN);
+  Serial.print("Pulse raw: "); Serial.println(pulseValue);
+
+  if (pulseSensorActive) {
+    // Rising edge detection
+    if (pulseValue > thresholdHigh && !pulseDetected) {
+      unsigned long interval = now - lastBeatTime;
+      if (interval >= 300 && interval <= 2000) {
+        bpm = 60000 / interval;
+        Serial.print("BPM: "); Serial.println(bpm);
+      }
+      lastBeatTime = now;
+      pulseDetected = true;
+      digitalWrite(LED_PIN, HIGH);
+    }
+    // Falling edge detection
+    else if (pulseValue < thresholdLow && pulseDetected) {
+      pulseDetected = false;
+      digitalWrite(LED_PIN, LOW);
+    }
+  }
+  if (lvl == "Very High") {
+  Blynk.logEvent("high_stress", "Stress level is very high!");
+}
+
+  // --- OLED Display ---
+  if (now - lastDisplayUpdate >= displayInterval) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.print("Stress "); display.println(stress);
+    display.setCursor(0, 30);
+    display.print("BPM: ");   display.println(bpm);
+    display.display();
+    lastDisplayUpdate = now;
+  }
+
+  delay(50);
+}
